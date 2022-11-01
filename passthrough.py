@@ -3,7 +3,7 @@
 from __future__ import with_statement
 
 import os
-import sys
+import sys, traceback
 import errno
 import json
 import base64
@@ -137,12 +137,33 @@ class Passthrough(Operations):
     def chmod(self, path, mode):
         print("chmod")
         full_path = self._full_path(path)
-        return os.chmod(full_path, mode)
+        rand = - random.randint(1,1000)
+        self._turn_on(rand)
+        try:
+            ret = os.chmod(full_path, mode)
+            self._refresh(path)
+            self._release_lock(rand)
+            return ret
+        except Exception as e:
+            self._refresh(path)
+            self._release_lock(rand)
+            raise e
 
     def chown(self, path, uid, gid):
         print("chown")
         full_path = self._full_path(path)
-        return os.chown(full_path, uid, gid)
+        rand = - random.randint(1,1000)
+        self._turn_on(rand)
+        try:
+            ret = os.chown(full_path, uid, gid)
+            self._refresh(path)
+            self._release_lock(rand)
+            return ret
+        except Exception as e:
+            self._refresh(path)
+            self._release_lock(rand)
+            raise e
+        
 
     def getattr(self, path, fh=None):
         print("getattr "+path)
@@ -169,6 +190,7 @@ class Passthrough(Operations):
                      'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
         except Exception as e:
             self._release_lock(rand)
+            print("error")
             raise e
             return None
 
@@ -208,11 +230,16 @@ class Passthrough(Operations):
     def rmdir(self, path):
         print("rmdir")
         rand = - random.randint(1,1000)
+        print("rmdir1")
         self._turn_on(rand)
         full_path = self._full_path(path)
         ret = os.rmdir(full_path)
-        self._refresh(path)
+        print("rmdi2")
+        os.remove(os.path.join(self._full_shadow_path(path), "._attrs_18ab"))
+        os.rmdir(self._full_shadow_path(path))
+        print("rmdir3")
         self._release_lock(rand)
+        print("rmdir4")
         return ret
 
     def mkdir(self, path, mode):
@@ -246,6 +273,7 @@ class Passthrough(Operations):
                 'f_frsize', 'f_namemax'))
         except Exception as e:
             self._release_lock(rand)
+            print("error")
             raise e
             return None
     def unlink(self, path):
@@ -255,11 +283,12 @@ class Passthrough(Operations):
         try:
             ret = os.unlink(self._full_path(path))
             ret = os.unlink(self._full_shadow_path(path))
-            self._refresh(path)
             self._release_lock(rand)
             return ret
         except Exception as e:
             self._release_lock(rand)
+            traceback.print_exc(file=sys.stdout)
+            print("error")
             raise e
         
 
@@ -278,7 +307,7 @@ class Passthrough(Operations):
         rand = - random.randint(1,1000)
         self._turn_on(rand)
         ret = os.rename(self._full_path(old), self._full_path(new))
-        self._refresh(old)
+        os.remove(self._full_shadow_path(old), "._attrs_18ab")
         self._refresh(new)
         self._release_lock(rand)
         return ret
@@ -310,6 +339,7 @@ class Passthrough(Operations):
         try:
             ret = os.open(full_path, flags)
         except Exception as e:
+            print("error")
             self._release_lock(rand)
             raise e
         self._get_lock(ret)
@@ -325,12 +355,17 @@ class Passthrough(Operations):
         self._turn_on(rand)
         uid, gid, pid = fuse_get_context()
         full_path = self._full_path(path)
-        fd = os.open(full_path, os.O_WRONLY | os.O_CREAT, mode)
-        self._get_lock(fd)
-        self._release_lock(rand) #release lock of turn_on
-        os.chown(full_path,uid,gid) #chown to context uid & gid
-        self._refresh(path)
-        return fd
+        try:
+            fd = os.open(full_path, os.O_WRONLY | os.O_CREAT, mode)
+            self._get_lock(fd)
+            self._release_lock(rand) #release lock of turn_on
+            os.chown(full_path,uid,gid) #chown to context uid & gid
+            self._refresh(path)
+            return fd
+        except Exception as e:
+            print("error")
+            self._release_lock(rand)
+            raise e
 
     def read(self, path, length, offset, fh):
         print("read")
@@ -355,6 +390,7 @@ class Passthrough(Operations):
             self._refresh(path)
             self._release_lock(rand)
         except Exception as e:
+            print("error")
             self._release_lock(rand)
             raise e
 

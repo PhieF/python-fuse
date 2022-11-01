@@ -5,7 +5,7 @@ from sys import exit
 import os
 import subprocess
 
-state = "off"
+state = "on"
 def handler(signal_received, frame):
     # on gère un cleanup propre
     print('')
@@ -39,11 +39,13 @@ def delete_old_locks():
         for name in os.listdir("hddlock"):
             path = os.path.join("hddlock", name)
             if(name.startswith("released_")):
-                if(current - os.path.getmtime(path) > 30):
+                try:
+                    if(current - os.path.getmtime(path) > 30):
                 
-                    print("more than 30")
-                    os.remove(path)
-                
+                        print("more than 30")
+                        os.remove(path)
+                except Exception as e:
+                    print("oopsi")
 
 def turn_on():
     global state
@@ -59,7 +61,6 @@ def turn_off():
     umount_all()
     gpio.output(4, gpio.HIGH)
     state = "off"
-
 
 def umount(path):
     cmd = 'umount -l ' + path
