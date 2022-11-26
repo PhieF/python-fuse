@@ -11,6 +11,7 @@ from pathlib import Path
 from signal import signal, SIGINT
 import time
 import random
+import threading   
 
 from fuse import FUSE, FuseOSError, Operations, fuse_get_context
 
@@ -28,6 +29,8 @@ class Passthrough(Operations):
     def __init__(self, root):
         self.root = root
         self.current_lock = 0
+        self.locks = []
+        self.lock = threading.Lock() 
         self.base_64_name = base64.b64encode(root.encode('utf8')).decode("ascii")
         self.shadow_root = self.base_64_name+"/"
         to_remove = len(root)
@@ -72,36 +75,45 @@ class Passthrough(Operations):
     # =======
     def _turn_on(self, lock_number):
         self._get_lock(lock_number)
+        i = 0
         while (not os.path.ismount(self.root)):
+
             time.sleep(2)
+            i = i + 1
+            if(i >= 60):
+                break
+
             
         return
         
     def _get_lock(self, fd=None):
-        if(fd==None):
-            self.current_lock = self.current_lock + 1
-            print("holding "+"hddlock/"+self.base_64_name+"_"+str(self.current_lock))
-            Path("hddlock/"+self.base_64_name+"_"+str(self.current_lock)).touch()
-        else:
-            print("holding "+"hddlock/"+self.base_64_name+"_fd_"+str(fd))
-            Path("hddlock/"+self.base_64_name+"_fd_"+str(fd)).touch()
+        with self.lock:
+            self.locks.append(fd)
+            if(not os.path.exists("hddlock/"+self.base_64_name)):
+                Path("hddlock/"+self.base_64_name).touch()
+            print("get log for "+str(fd))
         
         
     def _release_lock(self, fd=None):
-        if(fd==None):
-            print("releasing "+"hddlock/"+self.base_64_name+"_"+str(self.current_lock))
-            os.rename("hddlock/"+self.base_64_name+"_"+str(self.current_lock), "hddlock/released_"+self.base_64_name+"_"+str(self.current_lock))
-            self.current_lock = self.current_lock - 1
-        else:
-            print("releasing hddlock/"+self.base_64_name+"_fd_"+str(fd))
-            os.rename("hddlock/"+self.base_64_name+"_fd_"+str(fd), "hddlock/released_"+self.base_64_name+"_fd_"+str(fd))
-        
+        with self.lock:
+            self.locks.remove(fd)
+            if(len(self.locks) == 0):
+                os.rename("hddlock/"+self.base_64_name, "hddlock/released_"+self.base_64_name)
+#        for lock in self.locks:
+#            print("still locks"+str(lock))
+
     def _refresh(self, path):
         shadow_path = self._full_shadow_path(path)
         towrite = {}
         #print("refresh "+path+" to shadow_path " +shadow_path)
         towrite['attr'] = self._fs_getattr(path)
-        towrite['stat'] = self._fs_statfs(path)
+        error = None
+        try:    
+            towrite['stat'] = self._fs_statfs(path)
+        except Exception as e:
+            error = e
+        if(os.path.islink(self._full_path((path)))):
+            towrite['link'] = self._fs_readlink(path)
         if(os.path.isdir(self._full_path(path))):
             os.makedirs(shadow_path, exist_ok =True)
             f = open(os.path.join(shadow_path,"._attrs_18ab"), "w")
@@ -112,6 +124,8 @@ class Passthrough(Operations):
             #print("json to write "+json.dumps(towrite))
             f.write(json.dumps(towrite))
             f.close()
+        if(error != None):
+            raise error
         return towrite
 
     def _full_path(self, partial):
@@ -130,7 +144,7 @@ class Passthrough(Operations):
 
     def access(self, path, mode):
         print("access "+path)
-        full_path = self._full_path(path)
+        full_path = self._full_shadow_path(path)
         if not os.access(full_path, mode):
             raise FuseOSError(errno.EACCES)
 
@@ -138,30 +152,30 @@ class Passthrough(Operations):
         print("chmod")
         full_path = self._full_path(path)
         rand = - random.randint(1,1000)
-        self._turn_on(rand)
+        self._turn_on(path)
         try:
             ret = os.chmod(full_path, mode)
             self._refresh(path)
-            self._release_lock(rand)
+            self._release_lock(path)
             return ret
         except Exception as e:
             self._refresh(path)
-            self._release_lock(rand)
+            self._release_lock(path)
             raise e
 
     def chown(self, path, uid, gid):
         print("chown")
         full_path = self._full_path(path)
         rand = - random.randint(1,1000)
-        self._turn_on(rand)
+        self._turn_on(path)
         try:
             ret = os.chown(full_path, uid, gid)
             self._refresh(path)
-            self._release_lock(rand)
+            self._release_lock(path)
             return ret
         except Exception as e:
             self._refresh(path)
-            self._release_lock(rand)
+            self._release_lock(path)
             raise e
         
 
@@ -176,20 +190,20 @@ class Passthrough(Operations):
             with open(full_path) as f:
                 return json.load(f)['attr']
         else:
-            return self._refresh(path)['attr']
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), full_path)
 
                      
     def _fs_getattr(self, path, fh=None):
         rand = - random.randint(1,1000)
-        self._turn_on(rand)
+        self._turn_on(path)
         full_path = self._full_path(path)
         try:
             st = os.lstat(full_path)
-            self._release_lock(rand)
+            self._release_lock(path)
             return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
                      'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
         except Exception as e:
-            self._release_lock(rand)
+            self._release_lock(path)
             print("error")
             raise e
             return None
@@ -207,48 +221,69 @@ class Passthrough(Operations):
 
     def readlink(self, path):
         print("readlink")
+        full_path = self._full_shadow_path(path)
+        if os.path.isdir(full_path):
+            with open(os.path.join(full_path, "._attrs_18ab")) as f:
+                json_str = json.load(f)
+                if 'link' in json_str:
+                    return json_str['link']
+                else:
+                    self._refresh(path)
+        elif os.path.isfile(full_path):
+            with open(full_path) as f:
+                json_str = json.load(f)
+                if 'link' in json_str:
+                    return json_str['link']
+                else:
+                    print("get link from refresh")
+                    self._refresh(path)
+        else:
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), full_path)
+            
+    def _fs_readlink(self, path):
+        print("readlink")
         rand = - random.randint(1,1000)
-        self._turn_on(rand)
+        self._turn_on(path)
         pathname = os.readlink(self._full_path(path))
         if pathname.startswith("/"):
             # Path name is absolute, sanitize it.
-            self._release_lock(rand)
+            self._release_lock(path)
             return os.path.relpath(pathname, self.root)
         else:
-            self._release_lock(rand)
+            self._release_lock(path)
             return pathname
 
     def mknod(self, path, mode, dev):
         print("mknod")
         rand = - random.randint(1,1000)
-        self._turn_on(rand)
+        self._turn_on(path)
         ret = os.mknod(self._full_path(path), mode, dev)
         self._refresh(path)
-        self._release_lock(rand)
+        self._release_lock(path)
         return ret
 
     def rmdir(self, path):
         print("rmdir")
         rand = - random.randint(1,1000)
         print("rmdir1")
-        self._turn_on(rand)
+        self._turn_on(path)
         full_path = self._full_path(path)
         ret = os.rmdir(full_path)
         print("rmdi2")
         os.remove(os.path.join(self._full_shadow_path(path), "._attrs_18ab"))
         os.rmdir(self._full_shadow_path(path))
         print("rmdir3")
-        self._release_lock(rand)
+        self._release_lock(path)
         print("rmdir4")
         return ret
 
     def mkdir(self, path, mode):
         print("mkdir")
         rand = - random.randint(1,1000)
-        self._turn_on(rand)
+        self._turn_on(path)
         ret = os.mkdir(self._full_path(path), mode)
         self._refresh(path)
-        self._release_lock(rand)
+        self._release_lock(path)
         return ret
 
     def statfs(self, path):
@@ -263,30 +298,30 @@ class Passthrough(Operations):
             
     def _fs_statfs(self, path):
         rand = - random.randint(1,1000)
-        self._turn_on(rand)
+        self._turn_on(path)
         full_path = self._full_path(path)
         try:
             stv = os.statvfs(full_path)
-            self._release_lock(rand)
+            self._release_lock(path)
             return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
                 'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
                 'f_frsize', 'f_namemax'))
         except Exception as e:
-            self._release_lock(rand)
+            self._release_lock(path)
             print("error")
             raise e
             return None
     def unlink(self, path):
         print("unlink")
         rand = - random.randint(1,1000)
-        self._turn_on(rand)
+        self._turn_on(path)
         try:
             ret = os.unlink(self._full_path(path))
             ret = os.unlink(self._full_shadow_path(path))
-            self._release_lock(rand)
+            self._release_lock(path)
             return ret
         except Exception as e:
-            self._release_lock(rand)
+            self._release_lock(path)
             traceback.print_exc(file=sys.stdout)
             print("error")
             raise e
@@ -295,19 +330,28 @@ class Passthrough(Operations):
     def symlink(self, name, target):
         print("symlink")
         rand = - random.randint(1,1000)
-        self._turn_on(rand)
+        self._turn_on(path)
         ret = os.symlink(target, self._full_path(name))
         self._refresh(name)
         self._refresh(target)
-        self._release_lock(rand)
+        self._release_lock(path)
         return ret
 
     def rename(self, old, new):
         print("rename")
         rand = - random.randint(1,1000)
         self._turn_on(rand)
-        ret = os.rename(self._full_path(old), self._full_path(new))
-        os.remove(self._full_shadow_path(old), "._attrs_18ab")
+        try:
+           ret = os.rename(self._full_path(old), self._full_path(new))
+        except Exception as e:
+           self._release_lock(rand)
+           raise e
+        try:
+           os.remove(self._full_shadow_path(old))
+           os.remove(os.path.join(self._full_shadow_path(old), "._attrs_18ab"))
+           os.remove(self._full_shadow_path(old))
+        except Exception as e:
+           print(" shadow error")
         self._refresh(new)
         self._release_lock(rand)
         return ret
@@ -315,17 +359,17 @@ class Passthrough(Operations):
     def link(self, target, name):
         print("link")
         rand = - random.randint(1,1000)
-        self._turn_on(rand)
+        self._turn_on(path)
         ret = os.link(self._full_path(name), self._full_path(target))
-        self._release_lock(rand)
+        self._release_lock(path)
         return ret
 
     def utimens(self, path, times=None):
         print("utimens")
         rand = - random.randint(1,1000)
-        self._turn_on(rand)
+        self._turn_on(path)
         ret = os.utime(self._full_path(path), times)
-        self._release_lock(rand)
+        self._release_lock(path)
         return ret
 
     # File methods
@@ -334,16 +378,16 @@ class Passthrough(Operations):
     def open(self, path, flags):
         print("open "+path)
         rand = - random.randint(1,1000)
-        self._turn_on(rand)
+        self._turn_on(path)
         full_path = self._full_path(path)
         try:
             ret = os.open(full_path, flags)
         except Exception as e:
             print("error")
-            self._release_lock(rand)
+            self._release_lock(path)
             raise e
         self._get_lock(ret)
-        self._release_lock(rand) #release lock of turn_on
+        self._release_lock(path) #release lock of turn_on
         print("fd "+str(ret))
         self._refresh(path)
         return ret
@@ -352,19 +396,19 @@ class Passthrough(Operations):
         print("create")
         
         rand = - random.randint(1,1000)
-        self._turn_on(rand)
+        self._turn_on(path)
         uid, gid, pid = fuse_get_context()
         full_path = self._full_path(path)
         try:
             fd = os.open(full_path, os.O_WRONLY | os.O_CREAT, mode)
             self._get_lock(fd)
-            self._release_lock(rand) #release lock of turn_on
+            self._release_lock(path) #release lock of turn_on
             os.chown(full_path,uid,gid) #chown to context uid & gid
             self._refresh(path)
             return fd
         except Exception as e:
             print("error")
-            self._release_lock(rand)
+            self._release_lock(path)
             raise e
 
     def read(self, path, length, offset, fh):
@@ -382,16 +426,16 @@ class Passthrough(Operations):
     def truncate(self, path, length, fh=None):
         print("truncate")
         rand = - random.randint(1,1000)
-        self._turn_on(rand)
+        self._turn_on(path)
         full_path = self._full_path(path)
         try:
             with open(full_path, 'r+') as f:
                 f.truncate(length)
             self._refresh(path)
-            self._release_lock(rand)
+            self._release_lock(path)
         except Exception as e:
             print("error")
-            self._release_lock(rand)
+            self._release_lock(path)
             raise e
 
     def flush(self, path, fh):

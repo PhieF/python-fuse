@@ -5,7 +5,7 @@ from sys import exit
 import os
 import subprocess
 
-state = "on"
+state = len(os.listdir("hddlock"))<=0
 def handler(signal_received, frame):
     # on gère un cleanup propre
     print('')
